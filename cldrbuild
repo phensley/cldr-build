@@ -2,7 +2,7 @@
 
 # build pre-release cldr-json files using snapshot icu jars
 
-import os, re, sys
+import argparse, os, re, shutil, sys
 import requests
 from lxml.html import fromstring
 from subprocess import Popen
@@ -22,10 +22,6 @@ JAR_IDS = {
     'icu4j-for-cldr': '411079',
     'utilities-for-cldr': '411080'
 }
-
-STATUS = 'provisional'
-MATCH = '.*'
-TYPES = ['all']
 
 CLONE = ['clone', 'git@github.com:unicode-org/cldr.git']
 RESET = [
@@ -125,17 +121,32 @@ def patch_maven():
         raw = splice(raw, '<artifactId>%s</artifactId>' % jar, repl)
     open(path, 'w').write(raw)
 
-def main():
-    # create temp dir
-    makedirs(BUILD, JARS, OUT)
+def parse_args():
+    params = dict(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p = argparse.ArgumentParser(
+        prog=sys.argv[0],
+        description='Build pre-release cldr-json',
+        **params)
 
+    s = p.add_subparsers(dest='cmd')
+
+    x = s.add_parser('clean', **params)
+
+    x = s.add_parser('build', **params)
+    x.add_argument('--types', '-t', action='append')
+    x.add_argument('--match', '-m', default='.*')
+    x.add_argument('--status', '-s', default='contributed')
+
+    return p.parse_args()
+
+def run_build(args):
     # checkout the cldr code
     if not os.path.exists(CLDR):
         git(CLONE, BUILD)
 
     # reset the git repo to HEAD
-    for args in RESET:
-        git(args, CLDR)
+    for cmd in RESET:
+        git(cmd, CLDR)
 
     # ensure we have the latest snapshot jars
     check_version()
@@ -156,23 +167,41 @@ def main():
 
     mainclass = 'org.unicode.cldr.json.Ldml2JsonConverter'
 
-    cmd = [
-        'java',
-        '-DCLDR_DIR=' + CLDR,
-        '-cp', ':'.join(classpath),
-        mainclass,
-        '-m', MATCH,
-        '-l', 'optional',
-        '-p', 'true',
-        '-o', 'true',
-        '-r', 'true', 
-        '-t', 'all',
-        '-d', OUT,
-        '-s', STATUS,
-        '-V', VERSION
-    ]
-    run(cmd, ROOT)
+    types = args.types
+    if not types:
+        types = ['all']
 
+    for typ in types:
+        cmd = [
+            'java',
+            '-DCLDR_DIR=' + CLDR,
+            '-cp', ':'.join(classpath),
+            mainclass,
+            '-m', args.match,
+            '-l', 'optional',
+            '-p', 'true',
+            '-o', 'true',
+            '-r', 'true', 
+            '-t', typ,
+            '-d', OUT,
+            '-s', args.status,
+            '-V', VERSION
+        ]
+        run(cmd, ROOT)
+
+def run_clean():
+    shutil.rmtree(BUILD)
+    shutil.rmtree(JARS)
+
+def main():
+    # create temp dir
+    makedirs(BUILD, JARS, OUT)
+
+    args = parse_args()
+    if args.cmd == 'clean':
+        run_clean()
+    elif args.cmd == 'build':
+        run_build(args)
 
 if __name__ == '__main__':
     main()

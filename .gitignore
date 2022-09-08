@@ -1,0 +1,5 @@
+temp/
+jars/
+
+.DS_Store
+*.swp

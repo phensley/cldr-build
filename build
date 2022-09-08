@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+
+# build pre-release cldr-json files using snapshot icu jars
+
+import os, re, sys
+import requests
+from lxml.html import fromstring
+from subprocess import Popen
+from urllib.parse import urlparse, urljoin, parse_qs
+
+ROOT = os.path.abspath(os.path.dirname(__file__))
+
+VERSION = '42.0.0'
+TAG = 'release-42-alpha3'
+BUILD = os.path.join(ROOT, 'temp')
+CLDR = os.path.join(BUILD, 'cldr')
+TOOLS = os.path.join(CLDR, 'tools')
+OUT = os.path.join(BUILD, 'output')
+JARS = os.path.join(ROOT, 'jars')
+
+JAR_IDS = {
+    'icu4j-for-cldr': '411079',
+    'utilities-for-cldr': '411080'
+}
+
+STATUS = 'provisional'
+MATCH = '.*'
+TYPES = ['all']
+
+CLONE = ['clone', 'git@github.com:unicode-org/cldr.git']
+RESET = [
+    ['reset', '--hard'],
+    ['fetch', 'origin'],
+    ['checkout', TAG],
+    ['reset', '--hard'],
+]
+
+def git(args, cwd):
+    run(['git'] + args, cwd=cwd)
+
+def mvn(args, cwd):
+    env = { 'MAVEN_OPTS': '-Xmx8192m' }
+    run(['mvn', '-pl', 'cldr-code', '-DCLDR_DIR=' + CLDR] + args, cwd, env)
+
+def run(cmd, cwd, env=None):
+    _env = dict(os.environ)
+    if env:
+        _env.update(env)
+    print('running %r' % ' '.join(cmd))
+    Popen(cmd, cwd=cwd, env=_env).communicate()
+
+def fetch_jar(name, version):
+    print('downloading %r version %r' % (name, version))
+    filename = '%s-%s.jar' % (name, version)
+    base_url = 'https://github.com/unicode-org/icu/packages'
+    pkg_id = JAR_IDS[name]
+    versions_url = '%s/%s?version=%s' % (base_url, pkg_id, version)
+    raw = requests.get(versions_url).content
+    tree = fromstring(raw)
+    # examine each link to find the one that points to our jar file
+    for link in tree.xpath('//a'):
+        href = link.attrib.get('href')
+        if not href:
+            continue
+        url = urljoin(versions_url, href)
+        parts = urlparse(url)
+        if parts.netloc != 'github-registry-files.githubusercontent.com':
+            continue
+        query = parse_qs(parts.query)
+        cdisp = query.get('response-content-disposition')
+        if not cdisp:
+            continue
+        cdisp = cdisp[0].split('=', 1)
+        if len(cdisp) != 2 or cdisp[0] != 'filename':
+            continue
+        if filename != cdisp[1]:
+            continue
+
+        # whew.. now download and save the jar
+        res = requests.get(url)
+        path = os.path.join(JARS, filename)
+        open(path, 'wb').write(res.content)
+        return
+
+    raise Exception('failed to locate jar for %r' % filename)
+
+def makedirs(*dirs):
+    for d in dirs:
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+def splice(target, needle, string):
+    'insert a string into target after needle'
+    i = target.index(needle)
+    if i == -1:
+        raise Exception('failed to locate %r' % needle)
+    end = i + len(needle)
+    return target[:end] + string + target[end:]
+
+def extract_version():
+    pattern = re.compile('^<icu4j.version>([^<]+)</icu4j.version>$')
+    path = os.path.join(CLDR, 'tools', 'pom.xml')
+    for line in open(path, 'r'):
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        return m.group(1)
+    raise Exception('failed to get icu4j version from pom.xml')
+
+def check_version():
+    'check if we need to download a snapshot jar'
+    version = extract_version()
+    jars = set(os.listdir(JARS))
+    for name in JAR_IDS.keys():
+        key = '%s-%s.jar' % (name, version)
+        if key not in jars:
+            fetch_jar(name, version)
+
+def patch_maven():
+    'point maven dependencies to our local jars'
+    path = os.path.join(CLDR, 'tools', 'pom.xml')
+    raw = open(path, 'r').read()
+    for jar in JAR_IDS.keys():
+        repl = '\n<scope>system</scope><systemPath>%s/%s-${icu4j.version}.jar</systemPath>\n' % (JARS, jar)
+        raw = splice(raw, '<artifactId>%s</artifactId>' % jar, repl)
+    open(path, 'w').write(raw)
+
+def main():
+    # create temp dir
+    makedirs(BUILD, JARS, OUT)
+
+    # checkout the cldr code
+    if not os.path.exists(CLDR):
+        git(CLONE, BUILD)
+
+    # reset the git repo to HEAD
+    for args in RESET:
+        git(args, CLDR)
+
+    # ensure we have the latest snapshot jars
+    check_version()
+
+    # patch pom.xml to load private jars from local dir
+    patch_maven()
+
+    # compile
+    mvn(['compile'], TOOLS)
+
+    # package shaded jar
+    mvn(['package', '-Dmaven.test.skip'], TOOLS)
+
+    # run the tool to generate cldr-json files
+    classpath = []
+    classpath += [os.path.join(JARS, n) for n in os.listdir(JARS)]
+    classpath += [os.path.join(TOOLS, 'cldr-code', 'target', 'cldr-code.jar')]
+
+    mainclass = 'org.unicode.cldr.json.Ldml2JsonConverter'
+
+    cmd = [
+        'java',
+        '-DCLDR_DIR=' + CLDR,
+        '-cp', ':'.join(classpath),
+        mainclass,
+        '-m', MATCH,
+        '-l', 'optional',
+        '-p', 'true',
+        '-o', 'true',
+        '-r', 'true', 
+        '-t', 'all',
+        '-d', OUT,
+        '-s', STATUS,
+        '-V', VERSION
+    ]
+    run(cmd, ROOT)
+
+
+if __name__ == '__main__':
+    main()
+
